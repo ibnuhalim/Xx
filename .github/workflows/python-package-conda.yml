@@ -13,9 +13,15 @@ on:
         required: false
         type: string
 
+  # (Opsional) Jadwalkan otomatis, contoh tiap hari jam 02:00 UTC
+  # schedule:
+  #   - cron: '0 2 * * *'
+
 jobs:
   run-automation:
-    runs-on: ubuntu-latest
+    # Pin ke ubuntu-24.04 agar tidak kena breaking change saat
+    # ubuntu-latest naik ke versi Ubuntu berikutnya.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
@@ -30,11 +36,33 @@ jobs:
       - name: 🛠️ Install System Dependencies (Chrome & Xvfb)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y wget gnupg xvfb libxkbcommon-x11-0 \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-            libasound2 libpango-1.0-0 libcairo2
 
+          # Paket inti
+          sudo apt-get install -y wget gnupg xvfb ca-certificates jq curl
+
+          # Runtime libraries untuk Chrome.
+          # Catatan Ubuntu 24.04+: banyak paket sudah dinamai *t64.
+          # Loop dengan fallback agar satu nama yang hilang tidak menggagalkan semua.
+          for pkg in \
+            libxkbcommon-x11-0 \
+            libnss3 \
+            libatk1.0-0t64 libatk1.0-0 \
+            libatk-bridge2.0-0t64 libatk-bridge2.0-0 \
+            libcups2t64 libcups2 \
+            libdrm2 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libpango-1.0-0 \
+            libcairo2 \
+            libasound2t64 libasound2 \
+          ; do
+            sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️ skip: $pkg"
+          done
+
+          # Tambah repo Google Chrome (gpg dearmor, bukan apt-key)
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
             | sudo gpg --dearmor --yes -o /usr/share/keyrings/google-linux.gpg
@@ -43,13 +71,14 @@ jobs:
 
           sudo apt-get update -y
           sudo apt-get install -y google-chrome-stable
+
           google-chrome --version
           echo "✅ Chrome & Xvfb terinstal."
 
       - name: 📦 Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Pin versi agar build stabil
+          # Pin nodriver agar build stabil
           pip install nodriver==0.38.3 opencv-python-headless httpx Pillow
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
@@ -61,11 +90,11 @@ jobs:
           xvfb-run --auto-servernum bash -c '
             echo "DISPLAY=$DISPLAY"
             google-chrome --version
-            timeout 15 google-chrome \
+            timeout 20 google-chrome \
               --no-sandbox --disable-dev-shm-usage --disable-gpu \
               --headless=new --dump-dom about:blank 2>&1 | head -n 5
             echo "exit=$?"
-          ' || echo "⚠️ Chrome headless test failed (non-fatal)"
+          ' || echo "⚠️ Chrome headless test failed (non-fatal, lanjut saja)"
 
       - name: ⚙️ Create config.json
         env:
@@ -83,6 +112,7 @@ jobs:
           jq '.mail_domains = []' config.json > tmp.json \
             && mv tmp.json config.json
 
+          # Override proxy jika diinput
           if [ -n "$PROXY_INPUT" ]; then
             jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json \
               && mv tmp.json config.json
@@ -99,7 +129,7 @@ jobs:
         timeout-minutes: 30
         env:
           PROXY_URL: ${{ github.event.inputs.proxy }}
-          # JANGAN set DISPLAY di sini — biarkan xvfb-run yang mengatur
+          # JANGAN set DISPLAY di sini — xvfb-run yang mengaturnya
         run: |
           ACCOUNTS="${{ github.event.inputs.accounts }}"
           echo "Menjalankan pembuatan $ACCOUNTS akun via Cair..."

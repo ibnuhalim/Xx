@@ -13,10 +13,6 @@ on:
         required: false
         type: string
 
-  # (Opsional) Jadwalkan otomatis
-  # schedule:
-  #   - cron: '0 2 * * *'
-
 jobs:
   run-automation:
     runs-on: ubuntu-24.04
@@ -42,15 +38,8 @@ jobs:
             libatk1.0-0t64 libatk1.0-0 \
             libatk-bridge2.0-0t64 libatk-bridge2.0-0 \
             libcups2t64 libcups2 \
-            libdrm2 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            libgbm1 \
-            libpango-1.0-0 \
-            libcairo2 \
-            libasound2t64 libasound2 \
+            libdrm2 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libasound2 \
           ; do
             sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️ skip: $pkg"
           done
@@ -63,9 +52,14 @@ jobs:
 
           sudo apt-get update -y
           sudo apt-get install -y google-chrome-stable
-
           google-chrome --version
           echo "✅ Chrome & Xvfb terinstal."
+
+      - name: 🐧 Allow Unprivileged User Namespaces
+        run: |
+          echo "Mengizinkan user namespaces untuk Chrome sandbox..."
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
 
       - name: 📦 Install Python Dependencies
         run: |
@@ -75,18 +69,6 @@ jobs:
             pip install -r requirements.txt
           fi
           python -c "import nodriver; print('nodriver', nodriver.__version__)"
-
-      - name: 🐛 Verify Xvfb + Chrome Launch
-        run: |
-          echo "=== DISPLAY test ==="
-          xvfb-run --auto-servernum bash -c '
-            echo "DISPLAY=$DISPLAY"
-            google-chrome --version
-            timeout 20 google-chrome \
-              --no-sandbox --disable-dev-shm-usage --disable-gpu \
-              --headless=new --dump-dom about:blank 2>&1 | head -n 5
-            echo "exit=$?"
-          ' || echo "⚠️ Chrome headless test failed (non-fatal, lanjut saja)"
 
       - name: ⚙️ Create config.json
         env:
@@ -98,14 +80,11 @@ jobs:
           fi
           cp config.example.json config.json
 
-          jq '.mail_api = "https://cair.eu.cc"' config.json > tmp.json \
-            && mv tmp.json config.json
-          jq '.mail_domains = []' config.json > tmp.json \
-            && mv tmp.json config.json
+          jq '.mail_api = "https://cair.eu.cc"' config.json > tmp.json && mv tmp.json config.json
+          jq '.mail_domains = []' config.json > tmp.json && mv tmp.json config.json
 
           if [ -n "$PROXY_INPUT" ]; then
-            jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json \
-              && mv tmp.json config.json
+            jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json && mv tmp.json config.json
           fi
 
           echo "🔎 Cek Cair domains..."
@@ -124,11 +103,9 @@ jobs:
           echo "Menjalankan pembuatan $ACCOUNTS akun via Cair..."
 
           if [ -n "$PROXY_URL" ]; then
-            xvfb-run --auto-servernum \
-              python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
+            xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
           else
-            xvfb-run --auto-servernum \
-              python main.py --accounts "$ACCOUNTS"
+            xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS"
           fi
 
       - name: 📤 Upload Results

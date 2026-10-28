@@ -1,11 +1,10 @@
-name: Run bluk-cf Auto Signup
+name: Run bluk-cf (Cair mail)
 
 on:
-  # Menjalankan workflow secara manual dari tab Actions
   workflow_dispatch:
     inputs:
       accounts:
-        description: 'Jumlah akun yang akan dibuat'
+        description: 'Jumlah akun'
         required: true
         default: '1'
         type: string
@@ -14,7 +13,7 @@ on:
         required: false
         type: string
 
-  # (Opsional) Jadwalkan berjalan otomatis, contoh: setiap hari jam 2 pagi UTC
+  # (Opsional) Jadwalkan otomatis, contoh tiap hari jam 02:00 UTC
   # schedule:
   #   - cron: '0 2 * * *'
 
@@ -35,84 +34,74 @@ jobs:
       - name: 🛠️ Install System Dependencies (Chrome & Xvfb)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y wget gnupg xvfb
+          sudo apt-get install -y wget gnupg xvfb libxkbcommon-x11-0
 
-          # Hapus file sumber lama jika ada (menghindari konflik)
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
-
-          # Unduh kunci GPG Google dan konversi ke format biner (dearmor)
-          # Metode ini menggantikan 'apt-key' yang sudah dihapus di Ubuntu 24.04
           wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
             | sudo gpg --dearmor --yes -o /usr/share/keyrings/google-linux.gpg
-
-          # Tambahkan repositori Google Chrome dengan opsi signed-by
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
             | sudo tee /etc/apt/sources.list.d/google-chrome.list
 
-          # Update dan install Chrome
           sudo apt-get update -y
           sudo apt-get install -y google-chrome-stable
-
-          # Verifikasi instalasi
           google-chrome --version
-          echo "✅ Chrome dan Xvfb terinstal."
+          echo "✅ Chrome & Xvfb terinstal."
 
       - name: 📦 Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Dependensi inti sesuai scripts/setup.sh
           pip install nodriver opencv-python-headless httpx Pillow
-          # Install requirements.txt jika tersedia
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
 
       - name: ⚙️ Create config.json
         env:
-          MAIL_API: ${{ secrets.MAIL_API_URL }}
-          MAIL_DOMAINS: ${{ secrets.MAIL_DOMAINS_JSON }}
           PROXY_INPUT: ${{ github.event.inputs.proxy }}
         run: |
-          # Gunakan config.example.json sebagai template
           if [ ! -f config.example.json ]; then
             echo "❌ config.example.json tidak ditemukan!"
             exit 1
           fi
           cp config.example.json config.json
 
-          # Timpa mail_api jika secret tersedia
-          if [ -n "$MAIL_API" ]; then
-            jq --arg mail_api "$MAIL_API" '.mail_api = $mail_api' config.json > tmp.json \
-              && mv tmp.json config.json
-          fi
+          # Cair sebagai default mail API
+          jq '.mail_api = "https://cair.eu.cc"' config.json > tmp.json \
+            && mv tmp.json config.json
 
-          # Timpa mail_domains jika secret tersedia (harus format JSON array)
-          if [ -n "$MAIL_DOMAINS" ]; then
-            jq --argjson domains "$MAIL_DOMAINS" '.mail_domains = $domains' config.json > tmp.json \
-              && mv tmp.json config.json
-          fi
+          # Kosongkan mail_domains agar Cair auto-fetch (bisa diisi manual jika perlu)
+          jq '.mail_domains = []' config.json > tmp.json \
+            && mv tmp.json config.json
 
-          # Timpa proxy jika diinput lewat workflow_dispatch
+          # Override proxy jika diinput
           if [ -n "$PROXY_INPUT" ]; then
             jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json \
               && mv tmp.json config.json
           fi
 
-          echo "📄 config.json berhasil dibuat."
-          # Jangan print isi config.json untuk menghindari kebocoran secret
+          # Cek konektivitas Cair (info saja, tidak menggagalkan job)
+          echo "🔎 Cek Cair domains..."
+          curl -s -m 15 https://cair.eu.cc/domains \
+            | jq -r '."hydra:member" // .member // [] | map(select(.isActive==true)) | .[].domain' \
+            | head -n 5 || true
+
+          echo "📄 config.json siap (mail_api=cair.eu.cc)."
 
       - name: 🚀 Run bluk-cf
+        timeout-minutes: 30
         env:
           PROXY_URL: ${{ github.event.inputs.proxy }}
+          DISPLAY: ':99.0'
         run: |
           ACCOUNTS="${{ github.event.inputs.accounts }}"
-          echo "Menjalankan pembuatan $ACCOUNTS akun..."
+          echo "Menjalankan pembuatan $ACCOUNTS akun via Cair..."
 
-          # Xvfb diperlukan karena Chrome butuh display meskipun headless
           if [ -n "$PROXY_URL" ]; then
-            xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
+            xvfb-run --auto-servernum --server-num=99 \
+              python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
           else
-            xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS"
+            xvfb-run --auto-servernum --server-num=99 \
+              python main.py --accounts "$ACCOUNTS"
           fi
 
       - name: 📤 Upload Results

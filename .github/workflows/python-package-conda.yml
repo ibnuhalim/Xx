@@ -1,0 +1,111 @@
+name: Run bluk-cf Auto Signup
+
+on:
+  # Memungkinkan menjalankan workflow secara manual dari tab Actions
+  workflow_dispatch:
+    inputs:
+      accounts:
+        description: 'Jumlah akun yang akan dibuat'
+        required: true
+        default: '1'
+        type: string
+      proxy:
+        description: 'Proxy (opsional, format: http://user:pass@host:port)'
+        required: false
+        type: string
+
+  # (Opsional) Jadwalkan berjalan otomatis, contoh: setiap hari jam 2 pagi UTC
+  # schedule:
+  #   - cron: '0 2 * * *'
+
+jobs:
+  run-automation:
+    runs-on: ubuntu-latest
+    # Memberi waktu lebih untuk proses instalasi dan pembuatan akun
+    timeout-minutes: 120 
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 🛠️ Install System Dependencies (Chrome & Xvfb)
+        run: |
+          sudo apt-get update -y
+          # Install dependensi dasar
+          sudo apt-get install -y wget gnupg xvfb
+          # Tambahkan Google Chrome repository
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -y
+          # Install Google Chrome Stable
+          sudo apt-get install -y google-chrome-stable
+          echo "✅ Chrome dan Xvfb terinstal."
+
+      - name: 📦 Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Dependensi inti dari setup.sh
+          pip install nodriver opencv-python-headless httpx Pillow
+          # Jika ada requirements.txt, install juga
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # Playwright browser (opsional, sesuai setup.sh)
+          if command -v playwright &> /dev/null; then
+            playwright install chromium || true
+          fi
+
+      - name: ⚙️ Create config.json
+        env:
+          # Simpan nilai sensitif di Repository Secrets
+          MAIL_API: ${{ secrets.MAIL_API_URL }}
+          MAIL_DOMAINS: ${{ secrets.MAIL_DOMAINS_JSON }}
+          PROXY_INPUT: ${{ github.event.inputs.proxy }}
+        run: |
+          # Gunakan config.example.json sebagai template
+          cp config.example.json config.json
+          
+          # Ganti nilai menggunakan jq (lebih aman daripada sed)
+          # Pastikan secret MAIL_DOMAINS_JSON berisi format array JSON, misal: '["domain1.com","domain2.com"]'
+          jq --arg mail_api "$MAIL_API" \
+             --arg proxy "$PROXY_INPUT" \
+             '.mail_api = $mail_api | .proxy = (if $proxy == "" then null else $proxy end)' \
+             config.json > tmp.json && mv tmp.json config.json
+          
+          # Jika secret MAIL_DOMAINS_JSON diisi, gunakan itu
+          if [ -n "$MAIL_DOMAINS" ]; then
+            jq --argjson domains "$MAIL_DOMAINS" '.mail_domains = $domains' config.json > tmp.json && mv tmp.json config.json
+          fi
+          
+          echo "📄 config.json berhasil dibuat (nilai sensitif disembunyikan)."
+          # Jangan pernah mencetak isi config.json secara penuh untuk menghindari kebocoran secret
+
+      - name: 🚀 Run bluk-cf
+        env:
+          # Teruskan proxy sebagai environment variable jika diperlukan oleh main.py
+          PROXY_URL: ${{ github.event.inputs.proxy }}
+        run: |
+          ACCOUNTS="${{ github.event.inputs.accounts }}"
+          echo "Menjalankan pembuatan $ACCOUNTS akun..."
+          
+          if [ -n "$PROXY_URL" ]; then
+            xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
+          else
+            xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS"
+          fi
+
+      - name: 📤 Upload Results
+        if: always() # Tetap unggah hasil meskipun step sebelumnya gagal
+        uses: actions/upload-artifact@v4
+        with:
+          name: bluk-cf-results
+          path: |
+            results.json
+            *.txt
+          retention-days: 7
+          if-no-files-found: warn

@@ -13,10 +13,6 @@ on:
         required: false
         type: string
 
-  # (Opsional) Jadwalkan otomatis, contoh tiap hari jam 02:00 UTC
-  # schedule:
-  #   - cron: '0 2 * * *'
-
 jobs:
   run-automation:
     runs-on: ubuntu-latest
@@ -34,7 +30,10 @@ jobs:
       - name: 🛠️ Install System Dependencies (Chrome & Xvfb)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y wget gnupg xvfb libxkbcommon-x11-0
+          sudo apt-get install -y wget gnupg xvfb libxkbcommon-x11-0 \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+            libasound2 libpango-1.0-0 libcairo2
 
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
@@ -50,10 +49,23 @@ jobs:
       - name: 📦 Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install nodriver opencv-python-headless httpx Pillow
+          # Pin versi agar build stabil
+          pip install nodriver==0.38.3 opencv-python-headless httpx Pillow
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
+
+      - name: 🐛 Verify Xvfb + Chrome Launch
+        run: |
+          echo "=== DISPLAY test ==="
+          xvfb-run --auto-servernum bash -c '
+            echo "DISPLAY=$DISPLAY"
+            google-chrome --version
+            timeout 15 google-chrome \
+              --no-sandbox --disable-dev-shm-usage --disable-gpu \
+              --headless=new --dump-dom about:blank 2>&1 | head -n 5
+            echo "exit=$?"
+          ' || echo "⚠️ Chrome headless test failed (non-fatal)"
 
       - name: ⚙️ Create config.json
         env:
@@ -68,18 +80,14 @@ jobs:
           # Cair sebagai default mail API
           jq '.mail_api = "https://cair.eu.cc"' config.json > tmp.json \
             && mv tmp.json config.json
-
-          # Kosongkan mail_domains agar Cair auto-fetch (bisa diisi manual jika perlu)
           jq '.mail_domains = []' config.json > tmp.json \
             && mv tmp.json config.json
 
-          # Override proxy jika diinput
           if [ -n "$PROXY_INPUT" ]; then
             jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json \
               && mv tmp.json config.json
           fi
 
-          # Cek konektivitas Cair (info saja, tidak menggagalkan job)
           echo "🔎 Cek Cair domains..."
           curl -s -m 15 https://cair.eu.cc/domains \
             | jq -r '."hydra:member" // .member // [] | map(select(.isActive==true)) | .[].domain' \
@@ -91,16 +99,16 @@ jobs:
         timeout-minutes: 30
         env:
           PROXY_URL: ${{ github.event.inputs.proxy }}
-          DISPLAY: ':99.0'
+          # JANGAN set DISPLAY di sini — biarkan xvfb-run yang mengatur
         run: |
           ACCOUNTS="${{ github.event.inputs.accounts }}"
           echo "Menjalankan pembuatan $ACCOUNTS akun via Cair..."
 
           if [ -n "$PROXY_URL" ]; then
-            xvfb-run --auto-servernum --server-num=99 \
+            xvfb-run --auto-servernum \
               python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
           else
-            xvfb-run --auto-servernum --server-num=99 \
+            xvfb-run --auto-servernum \
               python main.py --accounts "$ACCOUNTS"
           fi
 

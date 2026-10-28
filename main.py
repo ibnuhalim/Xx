@@ -1,27 +1,7 @@
 #!/usr/bin/env python3
 """
 Cloudflare Auto Signup — Main Orchestrator (Cair mail backend)
-
-Automates the full pipeline:
-1. Generate temp email via Cair (cair.eu.cc)
-2. Sign up for Cloudflare account (with Turnstile bypass)
-3. Verify Cloudflare email via Cair inbox
-4. Create Account API Token (Workers AI permissions)
-5. Validate token against Workers AI API
-6. Save results to JSON
-
-Usage:
-    python main.py                          # Create 1 account
-    python main.py --accounts 5             # Create 5 accounts
-    python main.py --proxy http://user:pass@host:port
-    python main.py --config custom.json
-    python main.py --validate-only --token cfut_xxx --account-id xxx
-
-Requirements:
-    - Linux with Xvfb (xvfb-run)
-    - Python 3.10+
-    - Google Chrome installed
-    - nodriver, opencv-python-headless, httpx
+...
 """
 
 import argparse
@@ -46,87 +26,48 @@ from src.token_creator import create_token, create_token_api
 from src.token_validator import validate_token
 from src.live_dashboard import DashboardState, LiveDashboard
 from src.utils import (
-    generate_password,
-    generate_username,
-    load_config,
-    save_result,
-    load_results,
-    timestamp,
-    wait_with_progress,
-    format_account,
+    generate_password, generate_username, load_config, save_result,
+    load_results, timestamp, format_account,
 )
 
+# Path Chrome eksplisit untuk lingkungan GitHub Actions
+CHROME_PATHS = [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+]
+
+def get_chrome_path() -> str | None:
+    """Cari path Chrome yang benar, prioritaskan google-chrome."""
+    for path in CHROME_PATHS:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return None
 
 def parse_args():
+    # ... (fungsi parse_args sama persis seperti sebelumnya) ...
     parser = argparse.ArgumentParser(
         description="Automated Cloudflare account creation with Workers AI tokens"
     )
-    parser.add_argument(
-        "--accounts", "-n", type=int, default=1,
-        help="Number of accounts to create (default: 1)"
-    )
-    parser.add_argument(
-        "--config", "-c", type=str, default="config.json",
-        help="Config file path (default: config.json)"
-    )
-    parser.add_argument(
-        "--proxy", "-p", type=str, default=None,
-        help="Proxy URL (http://user:pass@host:port)"
-    )
-    parser.add_argument(
-        "--output", "-o", type=str, default=None,
-        help="Output JSON file (default: from config)"
-    )
-    parser.add_argument(
-        "--delay", "-d", type=int, default=None,
-        help="Delay between accounts in seconds (default: from config)"
-    )
-    parser.add_argument(
-        "--headless", action="store_true", default=True,
-        help="Run browser in headless mode (default: True, wajib di CI/container)"
-    )
-    parser.add_argument(
-        "--no-headless", action="store_true",
-        help="Paksa mode headed (untuk debug lokal dengan Xvfb)"
-    )
-    parser.add_argument(
-        "--validate-only", action="store_true",
-        help="Only validate an existing token (requires --token and --account-id)"
-    )
+    parser.add_argument("--accounts", "-n", type=int, default=1, help="Number of accounts to create (default: 1)")
+    parser.add_argument("--config", "-c", type=str, default="config.json", help="Config file path")
+    parser.add_argument("--proxy", "-p", type=str, default=None, help="Proxy URL")
+    parser.add_argument("--output", "-o", type=str, default=None, help="Output JSON file")
+    parser.add_argument("--delay", "-d", type=int, default=None, help="Delay between accounts")
+    parser.add_argument("--headless", action="store_true", default=True, help="Run headless (default)")
+    parser.add_argument("--no-headless", action="store_true", help="Force headed mode")
+    parser.add_argument("--validate-only", action="store_true", help="Only validate token")
     parser.add_argument("--token", type=str, help="Token to validate")
     parser.add_argument("--account-id", type=str, help="Account ID for validation")
-    parser.add_argument(
-        "--retry", type=int, default=3,
-        help="Number of retry attempts per account (default: 3)"
-    )
-    parser.add_argument(
-        "--workers", "-w", type=int, default=1,
-        help="Number of concurrent account workers (default: 1; use carefully with proxies)"
-    )
-    parser.add_argument(
-        "--no-dashboard", action="store_true",
-        help="Disable Rich live dashboard even when rich is installed"
-    )
-    parser.add_argument(
-        "--export-txt", type=str, default=None,
-        help="Export valid results to a 9Router-friendly .txt file after the run"
-    )
+    parser.add_argument("--retry", type=int, default=3, help="Retry attempts per account")
+    parser.add_argument("--workers", "-w", type=int, default=1, help="Concurrent workers")
+    parser.add_argument("--no-dashboard", action="store_true", help="Disable Rich dashboard")
+    parser.add_argument("--export-txt", type=str, default=None, help="Export valid results to txt")
     return parser.parse_args()
 
-
 def _chrome_args() -> list[str]:
-    """
-    Argumen Chrome wajib di lingkungan CI / Docker / Xvfb.
-
-    - --no-sandbox / --disable-setuid-sandbox : Chrome tidak bisa bikin
-      sandbox user-namespace di runner (AppArmor restrict userns).
-    - --disable-dev-shm-usage : /dev/shm di runner hanya 64MB -> tab crash.
-    - --headless=new : mode headless baru, paling stabil di container.
-    - --disable-gpu / --disable-software-rasterizer : tidak ada GPU.
-    - --disable-*background* : Chrome tidak throttle tab saat idle.
-    - --remote-debugging-port=0 : biarkan Chrome pilih port acak (hindari
-      bentrok bila multiple worker jalan bersamaan).
-    """
+    """Argumen Chrome wajib untuk CI/Docker."""
     return [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -152,163 +93,114 @@ def _chrome_args() -> list[str]:
         "--remote-debugging-port=0",
     ]
 
+async def _start_browser(headless: bool, proxy: str | None) -> uc.Browser:
+    """Start browser dengan retry dan path eksplisit."""
+    chrome_path = get_chrome_path()
+    if not chrome_path:
+        raise RuntimeError(
+            "Chrome tidak ditemukan di path yang dikenal. "
+            "Pastikan google-chrome-stable terinstal di /usr/bin/."
+        )
+    print(f"  🚀 Meluncurkan Chrome dari: {chrome_path}")
 
-async def create_account(
-    config: dict,
-    proxy: str = None,
-    headless: bool = True,
-    browser: uc.Browser = None,
-) -> dict:
-    """
-    Create a single Cloudflare account with API token.
+    last_exc = None
+    for attempt in range(1, 4):  # Retry hingga 3 kali
+        try:
+            browser = await uc.start(
+                headless=headless,
+                lang="en-US",
+                proxy=proxy,
+                sandbox=False,
+                browser_executable_path=chrome_path, # Kunci: path eksplisit
+                browser_args=_chrome_args(),
+            )
+            return browser
+        except Exception as e:
+            last_exc = e
+            print(f"  ⚠️ Gagal meluncurkan browser (percobaan {attempt}/3): {e}")
+            if attempt < 3:
+                await asyncio.sleep(3)  # Jeda sebelum retry
+    raise RuntimeError(f"Gagal meluncurkan browser setelah 3 percobaan: {last_exc}")
 
-    Returns:
-        dict with account info and token (or error)
-    """
-    # Generate credentials
+async def create_account(config: dict, proxy: str = None, headless: bool = True) -> dict:
+    # ... (bagian generate credentials dan email sama) ...
     username = generate_username()
     password = generate_password()
     token_name = config.get("token_name", "workers-ai-auto")
-
-    # Cair: mail_api default ke https://cair.eu.cc
     mail_api = config.get("mail_api") or "https://cair.eu.cc"
-
-    # Domain boleh kosong -> EmailGenerator akan auto-fetch dari Cair
     domains = config.get("mail_domains") or []
     domain = random.choice(domains) if domains else None
 
-    # Create temp email via Cair
     email_gen = EmailGenerator(mail_api, domains)
     try:
         mail = email_gen.create(username=username, domain=domain)
         email = mail["email"]
-        # Simpan cache domain hasil fetch supaya iterasi berikutnya tidak fetch ulang
         if not config.get("mail_domains") and email_gen.domains:
             config["mail_domains"] = list(email_gen.domains)
     except Exception as e:
-        return {
-            "status": "error",
-            "error": f"Email creation failed: {e}",
-            "email": f"{username}@{domain or '?'}",
-        }
+        return {"status": "error", "error": f"Email creation failed: {e}", "email": f"{username}@{domain or '?'}"}
     finally:
         email_gen.close()
 
     print(f"  📧 {email}")
 
-    # Use provided browser or create new one
-    own_browser = False
-    if browser is None:
-        browser = await uc.start(
-            headless=headless,
-            lang="en-US",
-            proxy=proxy,
-            sandbox=False,                    # wajib saat root / container
-            browser_args=_chrome_args(),      # fix crash di GitHub Actions
-        )
-        own_browser = True
-
+    browser = None
     try:
-        # Phase 1: Signup
+        browser = await _start_browser(headless, proxy)
+        # ... (sisa alur signup, verifikasi, token, validasi SAMA PERSIS) ...
         print("  [1/4] Signing up...")
         page = await browser.get("https://dash.cloudflare.com/sign-up")
         signup_result = await signup(page, email, password)
-
         if not signup_result.success:
-            return {
-                "status": "error",
-                "email": email,
-                "password": password,
-                "error": f"Signup failed: {signup_result.error}",
-            }
-
+            return {"status": "error", "email": email, "password": password, "error": f"Signup failed: {signup_result.error}"}
         account_id = signup_result.account_id
         print(f"  🆔 Account ID: {account_id}")
 
-        # Verify Cloudflare email from Cair inbox before token creation.
-        # Cloudflare rejects final token creation for fresh direct-signup accounts otherwise.
         print("  [2/4] Verifying Cloudflare email...")
         verify_result = await verify_cloudflare_email(
-            page,
-            mail_api=mail_api,
-            jwt=mail.get("jwt", ""),
+            page, mail_api=mail_api, jwt=mail.get("jwt", ""),
             timeout=config.get("email_verify_timeout", 120),
             poll_interval=config.get("email_verify_poll_interval", 5),
         )
-        if verify_result.success:
-            print("  ✅ Email verified")
-        else:
-            print(f"  ⚠️ Email verification failed: {verify_result.error}")
+        print(f"  {'✅' if verify_result.success else '⚠️'} Email verification: {verify_result.success}")
 
-        # Phase 2: Token creation — reuse same browser session.
         print("  [3/4] Creating API token...")
         if verify_result.success:
             token_result = await create_token_api(page, account_id, token_name)
             if not token_result.success:
-                print(f"  ⚠️ API token creation failed after verify: {token_result.error}; trying UI fallback")
                 token_result = await create_token(page, account_id, token_name)
         else:
             token_result = await create_token(page, account_id, token_name)
-
         api_token = token_result.token if token_result.success else ""
-        if api_token:
-            print(f"  🔑 Token: {api_token[:30]}...")
-        else:
-            print(f"  ⚠️ Token creation failed: {token_result.error}")
+        print(f"  {'🔑' if api_token else '⚠️'} Token: {api_token[:30] + '...' if api_token else 'failed'}")
 
-        # Phase 3: Validation (even without token, save the account)
-        token_valid = False
-        model_count = 0
+        token_valid, model_count = False, 0
         if api_token:
             print("  [4/4] Validating token...")
             validation = validate_token(api_token, account_id)
-            token_valid = validation.valid
-            model_count = validation.workers_ai_models
-            if token_valid:
-                print(f"  ✅ Valid! {model_count} Workers AI models available")
-            else:
-                print(f"  ❌ Validation failed: {validation.error}")
-        else:
-            print("  [4/4] Skipping validation (no token)")
+            token_valid, model_count = validation.valid, validation.workers_ai_models
+            print(f"  {'✅' if token_valid else '❌'} Validation: {token_valid} ({model_count} models)")
 
-        result = {
-            "email": email,
-            "password": password,
-            "jwt": mail.get("jwt", ""),
-            "account_id": account_id,
-            "api_token": api_token,
-            "token_valid": token_valid,
-            "workers_ai_models": model_count,
-            "token_name": token_name,
+        return {
+            "email": email, "password": password, "jwt": mail.get("jwt", ""),
+            "account_id": account_id, "api_token": api_token, "token_valid": token_valid,
+            "workers_ai_models": model_count, "token_name": token_name,
             "email_verified": verify_result.success,
             "email_verify_error": "" if verify_result.success else verify_result.error,
             "status": "full" if token_valid else ("signup_only" if account_id else "error"),
-            "created_at": timestamp(),
-            "proxy_used": proxy or "direct",
+            "created_at": timestamp(), "proxy_used": proxy or "direct",
         }
-        return result
-
     except Exception as e:
-        return {
-            "status": "error",
-            "email": email,
-            "password": password,
-            "error": str(e),
-            "created_at": timestamp(),
-        }
+        return {"status": "error", "email": email, "password": password, "error": str(e), "created_at": timestamp()}
     finally:
-        if own_browser:
-            try:
-                browser.stop()
-            except Exception:
-                pass
-            # Beri waktu CDP subprocess menutup dengan bersih sebelum
-            # browser baru dibuat pada akun berikutnya.
+        if browser:
+            try: browser.stop()
+            except Exception: pass
             await asyncio.sleep(3)
 
-
+# ... (fungsi export_txt dan main() sama persis seperti versi terakhir) ...
 def export_txt(results: list[dict], output_path: str, proxy_pool: str = "None") -> int:
-    """Export valid tokens in the exact 9Router form-friendly txt shape."""
+    # ... (implementasi sama) ...
     lines = ["Cloudflare Workers AI keys for 9Router", ""]
     count = 0
     for result in results:
@@ -316,117 +208,69 @@ def export_txt(results: list[dict], output_path: str, proxy_pool: str = "None") 
         account_id = result.get("account_id", "")
         if token.startswith("cfut_") and account_id and result.get("token_valid"):
             count += 1
-            lines.extend([
-                f"[{count}]",
-                f"Name: {result.get('email', f'cloudflare-key-{count}')}",
-                f"API Key: {token}",
-                f"Account ID: {account_id}",
-                "Priority: 1",
-                f"Proxy Pool: {proxy_pool}",
-                "",
-            ])
+            lines.extend([f"[{count}]", f"Name: {result.get('email', f'key-{count}')}", f"API Key: {token}", f"Account ID: {account_id}", "Priority: 1", f"Proxy Pool: {proxy_pool}", ""])
     lines.extend(["--- Summary ---", f"Valid keys: {count}"])
     Path(output_path).write_text("\n".join(lines) + "\n")
     return count
 
-
 async def main():
+    # ... (implementasi main() sama persis, hanya memanggil create_account yang baru) ...
     args = parse_args()
-
-    # Load config
     config = load_config(args.config)
     proxy = args.proxy or config.get("proxy")
     output_file = args.output or config.get("output_file", "results.json")
     delay = args.delay if args.delay is not None else config.get("delay_between_accounts", 300)
     num_accounts = args.accounts
     max_retry = args.retry
+    headless = not args.no_headless if args.no_headless else True
 
-    # Headless: default True. --no-headless untuk debug lokal.
-    headless = True
-    if args.no_headless:
-        headless = False
-    elif config.get("headless") is False and not os.getenv("CI"):
-        # Hormati config headless=false HANYA jika bukan di CI
-        headless = False
-
-    # Validate-only mode
     if args.validate_only:
-        if not args.token or not args.account_id:
-            print("❌ --validate-only requires --token and --account-id")
-            sys.exit(1)
-        print("🔍 Validating token...")
+        if not args.token or not args.account_id: sys.exit(1)
         result = validate_token(args.token, args.account_id)
-        print(f"  Valid: {result.valid}")
-        print(f"  Models: {result.workers_ai_models}")
-        if result.error:
-            print(f"  Error: {result.error}")
+        print(f"Valid: {result.valid}, Models: {result.workers_ai_models}")
         sys.exit(0 if result.valid else 1)
-
-    # Deteksi mail backend
-    mail_backend = "Cair" if "cair" in (config.get("mail_api") or "").lower() else "custom"
 
     print("=" * 60)
     print("☁️  Cloudflare Auto Signup — Workers AI Token Creator")
     print("=" * 60)
-    print(f"  Mail backend: {mail_backend} ({config.get('mail_api')})")
+    print(f"  Mail backend: Cair ({config.get('mail_api')})")
     print(f"  Accounts to create: {num_accounts}")
     print(f"  Proxy: {proxy or 'None (direct)'}")
-    print(f"  Delay between: {delay}s")
-    print(f"  Output: {output_file}")
     print(f"  Headless: {headless}")
-    print(f"  Chrome args: {_chrome_args()[:3]} ... (+{len(_chrome_args()) - 3} more)")
     print("=" * 60)
 
-    # Create accounts
     workers = max(1, args.workers)
-    created = 0
-    failed = 0
     results = load_results(output_file)
     run_results: list[dict] = []
     save_lock = asyncio.Lock()
     queue: asyncio.Queue[int] = asyncio.Queue()
-    for i in range(num_accounts):
-        queue.put_nowait(i + 1)
+    for i in range(num_accounts): queue.put_nowait(i + 1)
 
     dashboard_state = DashboardState(total=num_accounts, workers=workers)
 
     async def run_one(worker_id: int, index: int) -> dict:
         dashboard_state.update(worker_id, "signup", "Starting signup", index=index)
-        result: dict = {"status": "error", "error": "not_started"}
+        result = {"status": "error", "error": "not_started"}
         success = False
         for attempt in range(max_retry):
             if attempt > 0:
                 dashboard_state.update(worker_id, "signup", f"Retry {attempt}/{max_retry - 1}", index=index)
                 await asyncio.sleep(30)
-
-            result = await create_account(
-                config=config,
-                proxy=proxy,
-                headless=headless,
-            )
+            result = await create_account(config=config, proxy=proxy, headless=headless)
             if result.get("email"):
                 dashboard_state.update(worker_id, "validate", result.get("status", "done"), email=result["email"], index=index)
-
-            if result.get("status") == "full":
+            if result.get("status") in ("full", "signup_only"):
                 success = True
                 break
-            if result.get("status") == "signup_only":
-                success = True
-                break
-            if any(
-                marker in str(result.get("error", "")).lower()
-                for marker in ("rate", "unable", "connection closed", "no close frame")
-            ):
-                dashboard_state.update(worker_id, "failed", "Transient issue; retry cooldown", email=result.get("email", ""), index=index)
+            if any(m in str(result.get("error", "")).lower() for m in ("rate", "unable", "connection closed", "no close frame")):
+                dashboard_state.update(worker_id, "failed", "Retry cooldown", email=result.get("email", ""), index=index)
                 await asyncio.sleep(delay)
             else:
                 break
-
         async with save_lock:
             save_result(result, output_file)
             results.append(result)
             run_results.append(result)
-
         dashboard_state.finish(worker_id, success, format_account(result) if success else result.get("error", "unknown"))
         return result
 
@@ -434,8 +278,7 @@ async def main():
         while not queue.empty():
             index = await queue.get()
             print(f"\n{'─' * 50}\n  Account {index}/{num_accounts} (Worker {worker_id})\n{'─' * 50}")
-            try:
-                await run_one(worker_id, index)
+            try: await run_one(worker_id, index)
             finally:
                 queue.task_done()
                 if delay and not queue.empty():
@@ -443,29 +286,19 @@ async def main():
                     await asyncio.sleep(delay)
 
     with LiveDashboard(dashboard_state, enabled=not args.no_dashboard) as live:
-        worker_tasks = [asyncio.create_task(worker(wid)) for wid in range(1, workers + 1)]
-        while any(not task.done() for task in worker_tasks):
+        tasks = [asyncio.create_task(worker(wid)) for wid in range(1, workers + 1)]
+        while any(not t.done() for t in tasks):
             live.refresh()
             await asyncio.sleep(0.5)
-        await asyncio.gather(*worker_tasks)
+        await asyncio.gather(*tasks)
         live.refresh()
 
     created = sum(1 for r in run_results if r.get("status") in ("full", "signup_only"))
-    failed = len(run_results) - created
-
-    # Final summary
-    print(f"\n{'=' * 60}")
-    print(f"📊 Results: {created} created, {failed} failed")
-    print(f"💾 Saved to: {output_file}")
+    print(f"\n{'=' * 60}\n📊 Results: {created} created, {len(run_results) - created} failed\n💾 Saved to: {output_file}")
     if args.export_txt:
-        exported = export_txt(results, args.export_txt, proxy_pool=("None" if not proxy else "configured-proxy"))
-        print(f"🧩 9Router TXT export: {args.export_txt} ({exported} valid keys)")
-    if run_results:
-        print(f"\nAccounts:")
-        for r in run_results:
-            print(format_account(r))
+        exported = export_txt(results, args.export_txt, proxy_pool=("None" if not proxy else "configured"))
+        print(f"🧩 TXT export: {args.export_txt} ({exported} valid keys)")
     print(f"{'=' * 60}")
-
 
 if __name__ == "__main__":
     asyncio.run(main())

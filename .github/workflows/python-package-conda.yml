@@ -13,14 +13,12 @@ on:
         required: false
         type: string
 
-  # (Opsional) Jadwalkan otomatis, contoh tiap hari jam 02:00 UTC
+  # (Opsional) Jadwalkan otomatis
   # schedule:
   #   - cron: '0 2 * * *'
 
 jobs:
   run-automation:
-    # Pin ke ubuntu-24.04 agar tidak kena breaking change saat
-    # ubuntu-latest naik ke versi Ubuntu berikutnya.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -36,13 +34,8 @@ jobs:
       - name: 🛠️ Install System Dependencies (Chrome & Xvfb)
         run: |
           sudo apt-get update -y
-
-          # Paket inti
           sudo apt-get install -y wget gnupg xvfb ca-certificates jq curl
 
-          # Runtime libraries untuk Chrome.
-          # Catatan Ubuntu 24.04+: banyak paket sudah dinamai *t64.
-          # Loop dengan fallback agar satu nama yang hilang tidak menggagalkan semua.
           for pkg in \
             libxkbcommon-x11-0 \
             libnss3 \
@@ -62,7 +55,6 @@ jobs:
             sudo apt-get install -y "$pkg" 2>/dev/null || echo "⚠️ skip: $pkg"
           done
 
-          # Tambah repo Google Chrome (gpg dearmor, bukan apt-key)
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
             | sudo gpg --dearmor --yes -o /usr/share/keyrings/google-linux.gpg
@@ -78,11 +70,11 @@ jobs:
       - name: 📦 Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Pin nodriver agar build stabil
-          pip install nodriver==0.38.3 opencv-python-headless httpx Pillow
+          pip install nodriver opencv-python-headless httpx Pillow
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
+          python -c "import nodriver; print('nodriver', nodriver.__version__)"
 
       - name: 🐛 Verify Xvfb + Chrome Launch
         run: |
@@ -106,13 +98,11 @@ jobs:
           fi
           cp config.example.json config.json
 
-          # Cair sebagai default mail API
           jq '.mail_api = "https://cair.eu.cc"' config.json > tmp.json \
             && mv tmp.json config.json
           jq '.mail_domains = []' config.json > tmp.json \
             && mv tmp.json config.json
 
-          # Override proxy jika diinput
           if [ -n "$PROXY_INPUT" ]; then
             jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json \
               && mv tmp.json config.json
@@ -129,7 +119,6 @@ jobs:
         timeout-minutes: 30
         env:
           PROXY_URL: ${{ github.event.inputs.proxy }}
-          # JANGAN set DISPLAY di sini — xvfb-run yang mengaturnya
         run: |
           ACCOUNTS="${{ github.event.inputs.accounts }}"
           echo "Menjalankan pembuatan $ACCOUNTS akun via Cair..."

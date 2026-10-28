@@ -109,6 +109,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def _chrome_args() -> list[str]:
+    """Argumen Chrome yang wajib di lingkungan CI / Docker / Xvfb."""
+    return [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",       # /dev/shm di runner hanya 64MB
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-features=Translate,BackForwardCache",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+    ]
+
+
 async def create_account(
     config: dict,
     proxy: str = None,
@@ -159,7 +177,8 @@ async def create_account(
             headless=headless,
             lang="en-US",
             proxy=proxy,
-            sandbox=False,  # required when running as root in VPS/Xvfb
+            sandbox=False,                    # penting saat root / Xvfb
+            browser_args=_chrome_args(),      # fix crash di GitHub Actions
         )
         own_browser = True
 
@@ -257,6 +276,8 @@ async def create_account(
                 browser.stop()
             except Exception:
                 pass
+            # Beri waktu CDP subprocess menutup dengan bersih sebelum
+            # browser baru dibuat pada akun berikutnya.
             await asyncio.sleep(3)
 
 

@@ -1,9 +1,16 @@
 """
 Cloudflare Signup Flow — Automated account creation via headless browser.
+
+Fix utama:
+1. Turnstile: tunggu auto-solve -> verify_cf -> iframe click -> inject token.
+   SELALU cek token non-kosong SEBELUM klik submit.
+2. Terms checkbox: otomatis dicentang jika ada yang unchecked & visible.
+3. Error reporting: hanya ambil [aria-invalid], [role=alert], [data-testid*=error].
+   Tidak lagi menyeret semua <p> di halaman.
 """
 
 import asyncio
-import os
+import json
 import re
 import time
 from pathlib import Path
@@ -11,7 +18,12 @@ from typing import Optional
 
 import nodriver as uc
 
-from .turnstile_bypass import verify_cf, is_turnstile_present
+from .turnstile_bypass import (
+    verify_cf,
+    is_turnstile_present,
+    get_turnstile_token,
+    inject_turnstile_token,
+)
 
 
 CLOUDFLARE_SIGNUP_URL = "https://dash.cloudflare.com/sign-up"
@@ -24,7 +36,6 @@ EMAIL_SELECTORS = [
     'input[autocomplete="email"]',
     'input[aria-label="Email"]',
     '[data-testid="signup-email"]',
-    'form input:not([type="hidden"]):not([type="checkbox"])',
 ]
 
 PASSWORD_SELECTORS = [
@@ -58,10 +69,13 @@ class SignupResult:
 
     def to_dict(self):
         return {
-            "success": self.success, "email": self.email, "password": self.password,
-            "account_id": self.account_id, "error": self.error,
+            "success": self.success, "email": self.email,
+            "password": self.password, "account_id": self.account_id,
+            "error": self.error,
         }
 
+
+# ------------------------------------------------------------------ debug
 
 async def _save_debug(page: uc.Tab, tag: str) -> None:
     try:
@@ -78,19 +92,27 @@ async def _save_debug(page: uc.Tab, tag: str) -> None:
         try:
             url = await page.evaluate("location.href", return_by_value=True)
             title = await page.evaluate("document.title", return_by_value=True)
-            body = await page.evaluate(
-                "document.body ? document.body.innerText.substring(0, 1000) : ''",
-                return_by_value=True,
-            )
+            state = await page.evaluate('''(() => {
+                const ts = document.querySelector('input[name="cf-turnstile-response"]');
+                const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+                return JSON.stringify({
+                    turnstile_len: ts ? (ts.value||'').length : -1,
+                    checkboxes: cbs.map(c => ({name: c.name||'', id: c.id||'', checked: c.checked, visible: !!(c.offsetWidth||c.offsetHeight)})),
+                    body: (document.body ? document.body.innerText.substring(0,800) : '')
+                });
+            })()''', return_by_value=True)
             (DEBUG_DIR / f"{tag}.txt").write_text(
-                f"URL: {url}\nTITLE: {title}\n\nBODY:\n{body}\n", encoding="utf-8"
+                f"URL: {url}\nTITLE: {title}\nSTATE: {state}\n",
+                encoding="utf-8",
             )
-            print(f"    🐛 debug: {tag} (url={url}, title={title})")
+            print(f"    🐛 debug: {tag} (url={url})")
         except Exception:
             pass
     except Exception:
         pass
 
+
+# ------------------------------------------------------------------ page state
 
 async def _page_state(page: uc.Tab) -> dict:
     try:
@@ -103,7 +125,7 @@ async def _page_state(page: uc.Tab) -> dict:
         title = ""
     try:
         body = str(await page.evaluate(
-            "document.body ? document.body.innerText.substring(0, 500) : ''",
+            "document.body ? document.body.innerText.substring(0,500) : ''",
             return_by_value=True,
         ))
     except Exception:
@@ -111,9 +133,8 @@ async def _page_state(page: uc.Tab) -> dict:
     low = (title + " " + body).lower()
     is_challenge = any(k in low for k in (
         "just a moment", "checking your browser", "verifying you are human",
-        "attention required", "please wait", "cf-browser-verification",
+        "attention required", "please wait",
     ))
-    # Deteksi apakah form signup sudah muncul
     try:
         has_form = bool(await page.evaluate(
             """(() => !!(
@@ -125,48 +146,34 @@ async def _page_state(page: uc.Tab) -> dict:
         ))
     except Exception:
         has_form = False
-    return {
-        "url": url, "title": title, "body": body,
-        "is_challenge": is_challenge, "has_form": has_form,
-    }
+    return {"url": url, "title": title, "body": body,
+            "is_challenge": is_challenge, "has_form": has_form}
 
 
 async def _wait_challenge_done(page: uc.Tab, timeout: int = 180) -> bool:
-    """
-    Tunggu challenge selesai. Strategi:
-    1. Tunggu auto-pass (headed mode sering auto-pass dalam 10-30 detik).
-    2. Jika stuck >10 detik, aktif panggil verify_cf (klik Turnstile).
-    3. Ulangi sampai timeout.
-    """
     start = time.time()
     last_verify = 0
     while time.time() - start < timeout:
         st = await _page_state(page)
         elapsed = int(time.time() - start)
-
-        # Selesai: bukan challenge DAN form sudah muncul
         if not st["is_challenge"] and st["has_form"]:
             print(f"    ✅ Challenge selesai setelah {elapsed}s (form muncul)")
             return True
         if not st["is_challenge"] and "/sign-up" in st["url"]:
-            # Halaman bukan challenge, meski form belum terdeteksi
             print(f"    ✅ Challenge selesai setelah {elapsed}s")
             return True
-
-        # Aktif solve Turnstile tiap ~10 detik jika challenge ada
         if st["is_challenge"] and (time.time() - last_verify) >= 10:
             last_verify = time.time()
             try:
                 if await is_turnstile_present(page):
-                    print(f"    → Challenge stuck ({elapsed}s), mencoba verify_cf...")
+                    print(f"    → Challenge stuck ({elapsed}s), verify_cf...")
                     await verify_cf(page, timeout=30)
                     await asyncio.sleep(3)
                     continue
-            except Exception as e:
-                print(f"    ⚠️ verify_cf: {e}")
-
+            except Exception:
+                pass
         if elapsed > 0 and elapsed % 20 == 0:
-            print(f"    … masih challenge ({elapsed}s) title={st['title'][:50]!r}")
+            print(f"    … masih challenge ({elapsed}s)")
         await asyncio.sleep(3)
     return False
 
@@ -182,13 +189,136 @@ async def _find_first(page: uc.Tab, selectors: list, timeout_each: float = 5.0):
     return None, None
 
 
-async def signup(
-    page: uc.Tab,
-    email: str,
-    password: str,
-    max_wait: int = 30,
-    retry_turnstile: bool = True,
-) -> SignupResult:
+# ------------------------------------------------------------------ turnstile
+
+async def _solve_turnstile_robust(page: uc.Tab, timeout: int = 120) -> str:
+    """
+    Strategi berlapis:
+    1. Cek token yang mungkin sudah auto-solve (tunggu 15s).
+    2. verify_cf (retry 3x).
+    3. Klik iframe Turnstile (retry 3x).
+    4. Verifikasi token benar-benar masuk ke hidden input; kalau tidak, inject paksa.
+    """
+    start = time.time()
+
+    # Lapis 1: auto-solve
+    print("    → Menunggu auto-solve (15s)...")
+    for _ in range(15):
+        tok = await get_turnstile_token(page)
+        if tok and len(tok) > 10:
+            print(f"    ✅ auto-solved ({len(tok)} chars)")
+            return tok
+        await asyncio.sleep(1)
+
+    # Lapis 2: verify_cf dengan retry
+    for attempt in range(3):
+        if time.time() - start > timeout:
+            break
+        print(f"    → verify_cf attempt {attempt+1}...")
+        tok = await verify_cf(page, timeout=45)
+        if tok and len(tok) > 10:
+            await asyncio.sleep(2)
+            in_form = await get_turnstile_token(page)
+            if not in_form or len(in_form) < 10:
+                print(f"    → inject token ke form ({len(tok)} chars)...")
+                await inject_turnstile_token(page, tok)
+            return tok
+        await asyncio.sleep(3)
+
+    # Lapis 3: klik iframe manual
+    for attempt in range(3):
+        if time.time() - start > timeout:
+            break
+        try:
+            print(f"    → klik iframe Turnstile (attempt {attempt+1})...")
+            iframe = await page.select(
+                'iframe[src*="challenges.cloudflare.com"]', timeout=5
+            )
+            if iframe:
+                await iframe.click()
+                await asyncio.sleep(10)
+                tok = await get_turnstile_token(page)
+                if tok and len(tok) > 10:
+                    return tok
+        except Exception as e:
+            print(f"    ⚠️ iframe click: {e}")
+        await asyncio.sleep(3)
+
+    return ""
+
+
+# ------------------------------------------------------------------ terms checkbox
+
+async def _ensure_terms_checked(page: uc.Tab) -> None:
+    """Centang semua checkbox visible yang belum checked."""
+    try:
+        cbs_json = await page.evaluate('''(() => {
+            const cbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+            return JSON.stringify(cbs.map((cb, i) => ({
+                idx: i,
+                name: cb.name || '',
+                id: cb.id || '',
+                checked: cb.checked,
+                visible: !!(cb.offsetWidth || cb.offsetHeight)
+            })));
+        })()''', return_by_value=True)
+        cbs = json.loads(cbs_json) if cbs_json else []
+        for cb in cbs:
+            if cb.get("visible") and not cb.get("checked"):
+                label = cb.get("name") or cb.get("id") or f"#{cb['idx']}"
+                print(f"    → centang checkbox: {label}")
+                try:
+                    await page.evaluate(f'''(() => {{
+                        const cbs = document.querySelectorAll('input[type="checkbox"]');
+                        const el = cbs[{cb['idx']}];
+                        if (el && !el.checked) el.click();
+                    }})()''')
+                    await asyncio.sleep(0.6)
+                except Exception as e:
+                    print(f"    ⚠️ checkbox click: {e}")
+    except Exception as e:
+        print(f"    ⚠️ _ensure_terms_checked: {e}")
+
+
+# ------------------------------------------------------------------ errors
+
+async def _get_real_errors(page: uc.Tab) -> list:
+    """Ambil HANYA error validasi nyata, bukan teks statis."""
+    try:
+        raw = await page.evaluate('''(() => {
+            const errs = [];
+            document.querySelectorAll('[aria-invalid="true"]').forEach(el => {
+                const l = el.getAttribute('aria-label') || el.name || el.id || '?';
+                errs.push('invalid: ' + l);
+            });
+            document.querySelectorAll('[role="alert"]').forEach(el => {
+                const t = (el.textContent || '').trim();
+                if (t && t.length < 200) errs.push(t);
+            });
+            document.querySelectorAll('[data-testid*="error"], .error-message').forEach(el => {
+                const t = (el.textContent || '').trim();
+                if (t && t.length < 200) errs.push(t);
+            });
+            document.querySelectorAll('input[type="checkbox"]:invalid').forEach(el => {
+                errs.push('checkbox required: ' + (el.name || el.id || '?'));
+            });
+            const ts = document.querySelector('input[name="cf-turnstile-response"]');
+            if (ts && !ts.value) errs.push('turnstile EMPTY');
+            return JSON.stringify(errs);
+        })()''', return_by_value=True)
+        try:
+            return json.loads(raw) if raw else []
+        except Exception:
+            return [str(raw)[:200]] if raw else []
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------------ main flow
+
+async def signup(page: uc.Tab, email: str, password: str,
+                 max_wait: int = 45, retry_turnstile: bool = True) -> SignupResult:
+
     print(f"    → Buka {CLOUDFLARE_SIGNUP_URL}")
     await page.get(CLOUDFLARE_SIGNUP_URL)
 
@@ -197,53 +327,36 @@ async def signup(
     if not ok:
         st = await _page_state(page)
         await _save_debug(page, "signup_challenge_stuck")
-        return SignupResult(
-            False, email=email,
-            error=f"Challenge stuck: title={st['title']!r} url={st['url']}",
-            page_url=st["url"],
-        )
+        return SignupResult(False, email=email,
+                            error=f"Challenge stuck: {st['title']!r}", page_url=st["url"])
 
     await asyncio.sleep(5)
     st = await _page_state(page)
-    print(f"    → Page: {st['url']} | title={st['title'][:60]!r} | form={st['has_form']}")
-
-    if "/sign-up" not in st["url"]:
-        await _save_debug(page, "signup_redirect")
-        return SignupResult(
-            False, email=email,
-            error=f"Redirect tidak terduga: {st['url']}",
-            page_url=st["url"],
-        )
+    print(f"    → Page: {st['url']} | title={st['title'][:60]!r}")
 
     # Email
-    print("    → Mencari field email...")
-    email_sel, email_input = await _find_first(page, EMAIL_SELECTORS, timeout_each=5.0)
+    print("    → Field email...")
+    email_sel, email_input = await _find_first(page, EMAIL_SELECTORS, 5.0)
     if not email_input:
-        await _save_debug(page, "signup_no_email_field")
-        return SignupResult(
-            False, email=email,
-            error=f"Email input not found ({len(EMAIL_SELECTORS)} selector)",
-            page_url=st["url"],
-        )
-    print(f"    ✅ email field: {email_sel}")
+        await _save_debug(page, "no_email_field")
+        return SignupResult(False, email=email,
+                            error="Email input not found", page_url=st["url"])
+    print(f"    ✅ {email_sel}")
     await email_input.click()
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.4)
     await email_input.send_keys(email)
     await asyncio.sleep(1)
 
     # Password
-    print("    → Mencari field password...")
-    pw_sel, pw_input = await _find_first(page, PASSWORD_SELECTORS, timeout_each=5.0)
+    print("    → Field password...")
+    pw_sel, pw_input = await _find_first(page, PASSWORD_SELECTORS, 5.0)
     if not pw_input:
-        await _save_debug(page, "signup_no_password_field")
-        return SignupResult(
-            False, email=email,
-            error=f"Password input not found ({len(PASSWORD_SELECTORS)} selector)",
-            page_url=st["url"],
-        )
-    print(f"    ✅ password field: {pw_sel}")
+        await _save_debug(page, "no_password_field")
+        return SignupResult(False, email=email,
+                            error="Password input not found", page_url=st["url"])
+    print(f"    ✅ {pw_sel}")
     await pw_input.click()
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.4)
     await pw_input.send_keys(password)
     await asyncio.sleep(2)
 
@@ -251,80 +364,71 @@ async def signup(
         await page.evaluate("window.scrollBy(0, 400)")
     except Exception:
         pass
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
-    # Turnstile (in-page, bukan interstitial)
+    # Turnstile
     turnstile_present = await is_turnstile_present(page)
     if turnstile_present:
-        print("    → Turnstile signup widget terdeteksi, solving...")
-        try:
-            token = await verify_cf(page, timeout=60)
-            print(f"    ✅ Turnstile solved: {str(token)[:20]}...")
-        except Exception as e:
-            if retry_turnstile:
-                await asyncio.sleep(5)
-                try:
-                    token = await verify_cf(page, timeout=60)
-                    print(f"    ✅ Turnstile retry: {str(token)[:20]}...")
-                except Exception as e2:
-                    await _save_debug(page, "signup_turnstile_fail")
-                    return SignupResult(False, email=email,
-                        error=f"Turnstile failed: {e2}", page_url=st["url"])
-            else:
-                await _save_debug(page, "signup_turnstile_fail")
-                return SignupResult(False, email=email,
-                    error=f"Turnstile failed: {e}", page_url=st["url"])
+        print("    → Turnstile terdeteksi, solving robust...")
+        token = await _solve_turnstile_robust(page, timeout=120)
+        if not token or len(token) < 10:
+            await _save_debug(page, "turnstile_failed")
+            return SignupResult(False, email=email,
+                                error="Turnstile solve failed: token empty",
+                                page_url=st["url"])
+        print(f"    ✅ Turnstile token ({len(token)} chars)")
     else:
-        print("    → Turnstile signup tidak terdeteksi")
-    await asyncio.sleep(5)
+        print("    → Turnstile tidak terdeteksi")
+
+    # TERMS CHECKBOX
+    await _ensure_terms_checked(page)
+    await asyncio.sleep(1)
 
     # Submit
-    print("    → Mencari tombol submit...")
-    submit_sel, submit_btn = await _find_first(page, SUBMIT_SELECTORS, timeout_each=4.0)
+    print("    → Tombol submit...")
+    submit_sel, submit_btn = await _find_first(page, SUBMIT_SELECTORS, 4.0)
     if not submit_btn:
-        await _save_debug(page, "signup_no_submit")
-        return SignupResult(
-            False, email=email,
-            error=f"Submit button not found ({len(SUBMIT_SELECTORS)} selector)",
-            page_url=st["url"],
-        )
-    print(f"    ✅ submit button: {submit_sel}")
+        await _save_debug(page, "no_submit")
+        return SignupResult(False, email=email,
+                            error="Submit button not found", page_url=st["url"])
+    print(f"    ✅ {submit_sel}")
+
+    # Verifikasi token SEBELUM klik
+    pre_token = await get_turnstile_token(page)
+    if not pre_token or len(pre_token) < 10:
+        print(f"    ⚠️ Token kosong SEBELUM submit, mencoba inject...")
+        await _solve_turnstile_robust(page, timeout=60)
+        pre_token = await get_turnstile_token(page)
+        if not pre_token or len(pre_token) < 10:
+            await _save_debug(page, "token_empty_before_submit")
+            return SignupResult(False, email=email,
+                                error="Token empty right before submit",
+                                page_url=st["url"])
+
     try:
         await submit_btn.scroll_into_view()
     except Exception:
         pass
     await asyncio.sleep(1)
     await submit_btn.click()
+    print("    → Submit diklik, menunggu redirect...")
 
-    print("    → Menunggu redirect...")
     for i in range(max_wait):
         await asyncio.sleep(1)
         url = str(await page.evaluate("location.href", return_by_value=True))
         if "/sign-up" not in url:
             print(f"    ✅ Redirect ke: {url}")
             break
-    await asyncio.sleep(10)
+
+    await asyncio.sleep(8)
 
     url = str(await page.evaluate("location.href", return_by_value=True))
     match = re.search(r"/([a-f0-9]{32})", url)
     if match:
-        return SignupResult(
-            True, email=email, password=password,
-            account_id=match.group(1), page_url=url,
-        )
+        return SignupResult(True, email=email, password=password,
+                            account_id=match.group(1), page_url=url)
 
     await _save_debug(page, "signup_no_redirect")
-    try:
-        error_msgs = await page.evaluate(
-            """Array.from(document.querySelectorAll('p, [role="alert"], .error, [data-testid*="error"]'))
-                .map(e => (e.textContent || '').trim())
-                .filter(t => t.length > 0 && t.length < 300).slice(0, 5)""",
-            return_by_value=True,
-        )
-    except Exception:
-        error_msgs = None
-    return SignupResult(
-        False, email=email,
-        error=str(error_msgs) if error_msgs else f"Redirect failed: {url[:120]}",
-        page_url=url,
-    )
+    errs = await _get_real_errors(page)
+    err_text = " | ".join(errs) if errs else f"Redirect failed: {url[:120]}"
+    return SignupResult(False, email=email, error=err_text, page_url=url)

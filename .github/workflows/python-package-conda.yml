@@ -1,7 +1,7 @@
 name: Run bluk-cf Auto Signup
 
 on:
-  # Memungkinkan menjalankan workflow secara manual dari tab Actions
+  # Menjalankan workflow secara manual dari tab Actions
   workflow_dispatch:
     inputs:
       accounts:
@@ -21,8 +21,7 @@ on:
 jobs:
   run-automation:
     runs-on: ubuntu-latest
-    # Memberi waktu lebih untuk proses instalasi dan pembuatan akun
-    timeout-minutes: 120 
+    timeout-minutes: 120
 
     steps:
       - name: 📥 Checkout repository
@@ -36,63 +35,80 @@ jobs:
       - name: 🛠️ Install System Dependencies (Chrome & Xvfb)
         run: |
           sudo apt-get update -y
-          # Install dependensi dasar
           sudo apt-get install -y wget gnupg xvfb
-          # Tambahkan Google Chrome repository
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+
+          # Hapus file sumber lama jika ada (menghindari konflik)
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+
+          # Unduh kunci GPG Google dan konversi ke format biner (dearmor)
+          # Metode ini menggantikan 'apt-key' yang sudah dihapus di Ubuntu 24.04
+          wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+            | sudo gpg --dearmor --yes -o /usr/share/keyrings/google-linux.gpg
+
+          # Tambahkan repositori Google Chrome dengan opsi signed-by
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+
+          # Update dan install Chrome
           sudo apt-get update -y
-          # Install Google Chrome Stable
           sudo apt-get install -y google-chrome-stable
+
+          # Verifikasi instalasi
+          google-chrome --version
           echo "✅ Chrome dan Xvfb terinstal."
 
       - name: 📦 Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          # Dependensi inti dari setup.sh
+          # Dependensi inti sesuai scripts/setup.sh
           pip install nodriver opencv-python-headless httpx Pillow
-          # Jika ada requirements.txt, install juga
+          # Install requirements.txt jika tersedia
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
-          fi
-          # Playwright browser (opsional, sesuai setup.sh)
-          if command -v playwright &> /dev/null; then
-            playwright install chromium || true
           fi
 
       - name: ⚙️ Create config.json
         env:
-          # Simpan nilai sensitif di Repository Secrets
           MAIL_API: ${{ secrets.MAIL_API_URL }}
           MAIL_DOMAINS: ${{ secrets.MAIL_DOMAINS_JSON }}
           PROXY_INPUT: ${{ github.event.inputs.proxy }}
         run: |
           # Gunakan config.example.json sebagai template
-          cp config.example.json config.json
-          
-          # Ganti nilai menggunakan jq (lebih aman daripada sed)
-          # Pastikan secret MAIL_DOMAINS_JSON berisi format array JSON, misal: '["domain1.com","domain2.com"]'
-          jq --arg mail_api "$MAIL_API" \
-             --arg proxy "$PROXY_INPUT" \
-             '.mail_api = $mail_api | .proxy = (if $proxy == "" then null else $proxy end)' \
-             config.json > tmp.json && mv tmp.json config.json
-          
-          # Jika secret MAIL_DOMAINS_JSON diisi, gunakan itu
-          if [ -n "$MAIL_DOMAINS" ]; then
-            jq --argjson domains "$MAIL_DOMAINS" '.mail_domains = $domains' config.json > tmp.json && mv tmp.json config.json
+          if [ ! -f config.example.json ]; then
+            echo "❌ config.example.json tidak ditemukan!"
+            exit 1
           fi
-          
-          echo "📄 config.json berhasil dibuat (nilai sensitif disembunyikan)."
-          # Jangan pernah mencetak isi config.json secara penuh untuk menghindari kebocoran secret
+          cp config.example.json config.json
+
+          # Timpa mail_api jika secret tersedia
+          if [ -n "$MAIL_API" ]; then
+            jq --arg mail_api "$MAIL_API" '.mail_api = $mail_api' config.json > tmp.json \
+              && mv tmp.json config.json
+          fi
+
+          # Timpa mail_domains jika secret tersedia (harus format JSON array)
+          if [ -n "$MAIL_DOMAINS" ]; then
+            jq --argjson domains "$MAIL_DOMAINS" '.mail_domains = $domains' config.json > tmp.json \
+              && mv tmp.json config.json
+          fi
+
+          # Timpa proxy jika diinput lewat workflow_dispatch
+          if [ -n "$PROXY_INPUT" ]; then
+            jq --arg proxy "$PROXY_INPUT" '.proxy = $proxy' config.json > tmp.json \
+              && mv tmp.json config.json
+          fi
+
+          echo "📄 config.json berhasil dibuat."
+          # Jangan print isi config.json untuk menghindari kebocoran secret
 
       - name: 🚀 Run bluk-cf
         env:
-          # Teruskan proxy sebagai environment variable jika diperlukan oleh main.py
           PROXY_URL: ${{ github.event.inputs.proxy }}
         run: |
           ACCOUNTS="${{ github.event.inputs.accounts }}"
           echo "Menjalankan pembuatan $ACCOUNTS akun..."
-          
+
+          # Xvfb diperlukan karena Chrome butuh display meskipun headless
           if [ -n "$PROXY_URL" ]; then
             xvfb-run --auto-servernum python main.py --accounts "$ACCOUNTS" --proxy "$PROXY_URL"
           else
@@ -100,12 +116,13 @@ jobs:
           fi
 
       - name: 📤 Upload Results
-        if: always() # Tetap unggah hasil meskipun step sebelumnya gagal
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bluk-cf-results
           path: |
             results.json
             *.txt
+            *.log
           retention-days: 7
           if-no-files-found: warn

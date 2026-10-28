@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Cloudflare Auto Signup — Main Orchestrator
+Cloudflare Auto Signup — Main Orchestrator (Cair mail backend)
 
 Automates the full pipeline:
-1. Generate temp email
+1. Generate temp email via Cair (cair.eu.cc)
 2. Sign up for Cloudflare account (with Turnstile bypass)
-3. Create Account API Token (Workers AI permissions)
-4. Validate token against Workers AI API
-5. Save results to JSON
+3. Verify Cloudflare email via Cair inbox
+4. Create Account API Token (Workers AI permissions)
+5. Validate token against Workers AI API
+6. Save results to JSON
 
 Usage:
     python main.py                          # Create 1 account
@@ -122,18 +123,30 @@ async def create_account(
     """
     # Generate credentials
     username = generate_username()
-    domain = random.choice(config["mail_domains"])
     password = generate_password()
     token_name = config.get("token_name", "workers-ai-auto")
-    mail_api = config["mail_api"]
 
-    # Create temp email
-    email_gen = EmailGenerator(mail_api, config["mail_domains"])
+    # Cair: mail_api default ke https://cair.eu.cc
+    mail_api = config.get("mail_api") or "https://cair.eu.cc"
+
+    # Domain boleh kosong -> EmailGenerator akan auto-fetch dari Cair
+    domains = config.get("mail_domains") or []
+    domain = random.choice(domains) if domains else None
+
+    # Create temp email via Cair
+    email_gen = EmailGenerator(mail_api, domains)
     try:
         mail = email_gen.create(username=username, domain=domain)
         email = mail["email"]
+        # Simpan cache domain hasil fetch supaya iterasi berikutnya tidak fetch ulang
+        if not config.get("mail_domains") and email_gen.domains:
+            config["mail_domains"] = list(email_gen.domains)
     except Exception as e:
-        return {"status": "error", "error": f"Email creation failed: {e}", "email": f"{username}@{domain}"}
+        return {
+            "status": "error",
+            "error": f"Email creation failed: {e}",
+            "email": f"{username}@{domain or '?'}",
+        }
     finally:
         email_gen.close()
 
@@ -167,7 +180,7 @@ async def create_account(
         account_id = signup_result.account_id
         print(f"  🆔 Account ID: {account_id}")
 
-        # Verify Cloudflare email from temp inbox before token creation.
+        # Verify Cloudflare email from Cair inbox before token creation.
         # Cloudflare rejects final token creation for fresh direct-signup accounts otherwise.
         print("  [2/4] Verifying Cloudflare email...")
         verify_result = await verify_cloudflare_email(
@@ -183,8 +196,6 @@ async def create_account(
             print(f"  ⚠️ Email verification failed: {verify_result.error}")
 
         # Phase 2: Token creation — reuse same browser session.
-        # After email verification, the direct dashboard API is the most stable path;
-        # keep the UI flow as fallback/debug for unverified or API-blocked cases.
         print("  [3/4] Creating API token...")
         if verify_result.success:
             token_result = await create_token_api(page, account_id, token_name)
@@ -246,9 +257,6 @@ async def create_account(
                 browser.stop()
             except Exception:
                 pass
-            # Give nodriver/CDP websocket subprocess a moment to close cleanly before
-            # starting the next account browser. This avoids intermittent
-            # "no close frame received or sent" / "Connection closed" on bulk runs.
             await asyncio.sleep(3)
 
 
@@ -299,9 +307,13 @@ async def main():
             print(f"  Error: {result.error}")
         sys.exit(0 if result.valid else 1)
 
+    # Deteksi mail backend
+    mail_backend = "Cair" if "cair" in (config.get("mail_api") or "").lower() else "custom"
+
     print("=" * 60)
     print("☁️  Cloudflare Auto Signup — Workers AI Token Creator")
     print("=" * 60)
+    print(f"  Mail backend: {mail_backend} ({config.get('mail_api')})")
     print(f"  Accounts to create: {num_accounts}")
     print(f"  Proxy: {proxy or 'None (direct)'}")
     print(f"  Delay between: {delay}s")
@@ -343,7 +355,6 @@ async def main():
                 success = True
                 break
             if result.get("status") == "signup_only":
-                # Account created but no token — still save for forensic/debug visibility.
                 success = True
                 break
             if any(

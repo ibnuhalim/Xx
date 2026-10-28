@@ -27,6 +27,7 @@ Requirements:
 import argparse
 import asyncio
 import json
+import os
 import random
 import sys
 import time
@@ -81,8 +82,12 @@ def parse_args():
         help="Delay between accounts in seconds (default: from config)"
     )
     parser.add_argument(
-        "--headless", action="store_true",
-        help="Run browser in headless mode"
+        "--headless", action="store_true", default=True,
+        help="Run browser in headless mode (default: True, wajib di CI/container)"
+    )
+    parser.add_argument(
+        "--no-headless", action="store_true",
+        help="Paksa mode headed (untuk debug lokal dengan Xvfb)"
     )
     parser.add_argument(
         "--validate-only", action="store_true",
@@ -110,27 +115,48 @@ def parse_args():
 
 
 def _chrome_args() -> list[str]:
-    """Argumen Chrome yang wajib di lingkungan CI / Docker / Xvfb."""
+    """
+    Argumen Chrome wajib di lingkungan CI / Docker / Xvfb.
+
+    - --no-sandbox / --disable-setuid-sandbox : Chrome tidak bisa bikin
+      sandbox user-namespace di runner (AppArmor restrict userns).
+    - --disable-dev-shm-usage : /dev/shm di runner hanya 64MB -> tab crash.
+    - --headless=new : mode headless baru, paling stabil di container.
+    - --disable-gpu / --disable-software-rasterizer : tidak ada GPU.
+    - --disable-*background* : Chrome tidak throttle tab saat idle.
+    - --remote-debugging-port=0 : biarkan Chrome pilih port acak (hindari
+      bentrok bila multiple worker jalan bersamaan).
+    """
     return [
         "--no-sandbox",
         "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",       # /dev/shm di runner hanya 64MB
+        "--disable-dev-shm-usage",
+        "--headless=new",
         "--disable-gpu",
         "--disable-software-rasterizer",
-        "--disable-features=Translate,BackForwardCache",
+        "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
         "--disable-backgrounding-occluded-windows",
+        "--disable-sync",
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--window-size=1280,800",
+        "--remote-debugging-port=0",
     ]
 
 
 async def create_account(
     config: dict,
     proxy: str = None,
-    headless: bool = False,
+    headless: bool = True,
     browser: uc.Browser = None,
 ) -> dict:
     """
@@ -177,7 +203,7 @@ async def create_account(
             headless=headless,
             lang="en-US",
             proxy=proxy,
-            sandbox=False,                    # penting saat root / Xvfb
+            sandbox=False,                    # wajib saat root / container
             browser_args=_chrome_args(),      # fix crash di GitHub Actions
         )
         own_browser = True
@@ -315,6 +341,14 @@ async def main():
     num_accounts = args.accounts
     max_retry = args.retry
 
+    # Headless: default True. --no-headless untuk debug lokal.
+    headless = True
+    if args.no_headless:
+        headless = False
+    elif config.get("headless") is False and not os.getenv("CI"):
+        # Hormati config headless=false HANYA jika bukan di CI
+        headless = False
+
     # Validate-only mode
     if args.validate_only:
         if not args.token or not args.account_id:
@@ -339,7 +373,8 @@ async def main():
     print(f"  Proxy: {proxy or 'None (direct)'}")
     print(f"  Delay between: {delay}s")
     print(f"  Output: {output_file}")
-    print(f"  Headless: {args.headless or config.get('headless', False)}")
+    print(f"  Headless: {headless}")
+    print(f"  Chrome args: {_chrome_args()[:3]} ... (+{len(_chrome_args()) - 3} more)")
     print("=" * 60)
 
     # Create accounts
@@ -367,7 +402,7 @@ async def main():
             result = await create_account(
                 config=config,
                 proxy=proxy,
-                headless=args.headless or config.get("headless", False),
+                headless=headless,
             )
             if result.get("email"):
                 dashboard_state.update(worker_id, "validate", result.get("status", "done"), email=result["email"], index=index)
